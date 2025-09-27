@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MonoGame.AvaloniaHost", "MonoGame.AvaloniaHost\MonoGame.AvaloniaHost.csproj", "{F2104F81-9863-45BF-9EA0-2CBBDE33FC39}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MonoGame.AvaloniaHost.Sample", "MonoGame.AvaloniaHost.Sample\MonoGame.AvaloniaHost.Sample.csproj", "{8DCD8F4E-DB7B-4C00-9860-FAB882D397F3}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MonoGameProject", "MonoGameProject\MonoGameProject.csproj", "{9356673E-E937-4A00-920F-239BC21D855B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F2104F81-9863-45BF-9EA0-2CBBDE33FC39}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F2104F81-9863-45BF-9EA0-2CBBDE33FC39}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F2104F81-9863-45BF-9EA0-2CBBDE33FC39}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F2104F81-9863-45BF-9EA0-2CBBDE33FC39}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8DCD8F4E-DB7B-4C00-9860-FAB882D397F3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8DCD8F4E-DB7B-4C00-9860-FAB882D397F3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8DCD8F4E-DB7B-4C00-9860-FAB882D397F3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8DCD8F4E-DB7B-4C00-9860-FAB882D397F3}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9356673E-E937-4A00-920F-239BC21D855B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9356673E-E937-4A00-920F-239BC21D855B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9356673E-E937-4A00-920F-239BC21D855B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9356673E-E937-4A00-920F-239BC21D855B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
