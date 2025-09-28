@@ -16,5 +16,5 @@
              to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
         <vm:MainWindowViewModel/>
     </Design.DataContext>
-        <avaloniaHost:MonoGameView x:Name="GameHost"  />
+        <avaloniaHost:MonoGameView x:Name="GameHost" />
 </Window>

@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MonoGame.AvaloniaHost")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+1eb2e55c70a5fd0ab5dd4c41db4dd85e6891524d")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+c6cc4e4739158270edbbad40a93d1990fdb3422a")]
 [assembly: System.Reflection.AssemblyProductAttribute("MonoGame.AvaloniaHost")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MonoGame.AvaloniaHost")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

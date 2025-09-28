@@ -4,541 +4,496 @@ using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Avalonia.OpenGL;
 
-namespace MonoGame.AvaloniaHost;
-
-/// <summary>
-/// Renderer: MonoGame → CPU double buffer → PBO upload → fullscreen quad.
-/// </summary>
-public sealed class MonoGameCpuRenderer : IDisposable
+namespace MonoGame.AvaloniaHost
 {
-    private readonly Game _game;
-    public MonoGameCpuRenderer(Game game) => _game = game ?? throw new ArgumentNullException(nameof(game));
-
-    // --- Minimal GL constants ---
-    private const int GL_TEXTURE_2D = 0x0DE1;
-    private const int GL_ARRAY_BUFFER = 0x8892;
-    private const int GL_STATIC_DRAW = 0x88E4;
-    private const int GL_STREAM_DRAW = 0x88E0;
-    private const int GL_FLOAT = 0x1406;
-    private const int GL_TRIANGLE_STRIP = 0x0005;
-    private const int GL_RGBA = 0x1908;
-    private const int GL_UNSIGNED_BYTE = 0x1401;
-    private const int GL_TEXTURE_MIN_FILTER = 0x2801;
-    private const int GL_TEXTURE_MAG_FILTER = 0x2800;
-    private const int GL_TEXTURE_WRAP_S = 0x2802;
-    private const int GL_TEXTURE_WRAP_T = 0x2803;
-    private const int GL_CLAMP_TO_EDGE = 0x812F;
-    private const int GL_LINEAR = 0x2601;
-    private const int GL_VERTEX_SHADER = 0x8B31;
-    private const int GL_FRAGMENT_SHADER = 0x8B30;
-    private const int GL_COMPILE_STATUS = 0x8B81;
-    private const int GL_INFO_LOG_LENGTH = 0x8B84;
-    private const int GL_LINK_STATUS = 0x8B82;
-    private const int GL_FRAMEBUFFER = 0x8D40;
-    private const int GL_TEXTURE0 = 0x84C0;
-
-    // New for PBO / packing
-    private const int GL_PIXEL_UNPACK_BUFFER = 0x88EC;
-    private const int GL_MAP_WRITE_BIT = 0x0002;
-    private const int GL_MAP_INVALIDATE_BUFFER_BIT = 0x0008;
-    private const int GL_UNPACK_ALIGNMENT = 0x0CF5;
-    private const int GL_COLOR_BUFFER_BIT = 0x00004000;
-
-    // GL state
-    private GlInterface? _gl;
-    private int _prog, _vao, _vbo, _tex;
-    private int _uTexLoc;
-    private bool _useVao;
-
-    // delegates not exposed by GlInterface
-    private delegate void Uniform1iDelegate(int location, int v0);
-    private Uniform1iDelegate? _uniform1i;
-
-    private delegate IntPtr MapBufferRangeDelegate(int target, IntPtr offset, IntPtr length, int access);
-    private MapBufferRangeDelegate? _mapBufferRange;
-
-    private delegate byte UnmapBufferDelegate(int target);
-    private UnmapBufferDelegate? _unmapBuffer;
-
-    private delegate void PixelStoreiDelegate(int pname, int param);
-    private PixelStoreiDelegate? _pixelStorei;
-
-    private delegate void TexSubImage2DDelegate(int target, int level, int xoff, int yoff, int w, int h, int format, int type, IntPtr data);
-    private TexSubImage2DDelegate? _texSubImage2D;
-
-    // PBO double buffer
-    private int _pbo0, _pbo1;
-    private int _pboWriteIndex; // 0 or 1
-
-    // current size (in physical pixels!)
-    private int _width = 1, _height = 1;
-
-    // deferred resize (requested from UI)
-    private bool _resizePending;
-    private int _pendingW, _pendingH;
-    private float _pendingScale;
-
-    // CPU double buffer
-    private byte[] _buf0 = Array.Empty<byte>();
-    private byte[] _buf1 = Array.Empty<byte>();
-    private GCHandle _pin0, _pin1;
-    private IntPtr _ptr0, _ptr1;
-    private int _writeIdx;
-    private bool _hasPending;
-
-    // diagnostics
-    private readonly Stopwatch _sw = Stopwatch.StartNew();
-    private TimeSpan _last;
-
     /// <summary>
-    /// Initialization on Avalonia GL thread.
+    /// MonoGame → CPU double buffer → PBO(double) → glTexSubImage2D → fullscreen quad.
+    /// Вариант для одного MonoGameView: кадр MonoGame считается в Render() Avalonia, PBO включены.
     /// </summary>
-    public void Init(GlInterface gl, int pixelWidth, int pixelHeight, float scale)
+    public sealed class MonoGameCpuRenderer : IDisposable
     {
-        _gl = gl;
-        _width = Math.Max(1, pixelWidth);
-        _height = Math.Max(1, pixelHeight);
+        private readonly Game _game;
+        public MonoGameCpuRenderer(Game game) => _game = game ?? throw new ArgumentNullException(nameof(game));
 
-        Console.WriteLine($"[Host] GL: {gl.Renderer} v{gl.Version}");
+        // ---- GL const ----
+        private const int GL_TEXTURE_2D = 0x0DE1;
+        private const int GL_ARRAY_BUFFER = 0x8892;
+        private const int GL_STATIC_DRAW = 0x88E4;
+        private const int GL_FLOAT = 0x1406;
+        private const int GL_TRIANGLE_STRIP = 0x0005;
+        private const int GL_RGBA = 0x1908;
+        private const int GL_UNSIGNED_BYTE = 0x1401;
+        private const int GL_TEXTURE_MIN_FILTER = 0x2801;
+        private const int GL_TEXTURE_MAG_FILTER = 0x2800;
+        private const int GL_TEXTURE_WRAP_S = 0x2802;
+        private const int GL_TEXTURE_WRAP_T = 0x2803;
+        private const int GL_CLAMP_TO_EDGE = 0x812F;
+        private const int GL_LINEAR = 0x2601;
+        private const int GL_VERTEX_SHADER = 0x8B31;
+        private const int GL_FRAGMENT_SHADER = 0x8B30;
+        private const int GL_COMPILE_STATUS = 0x8B81;
+        private const int GL_INFO_LOG_LENGTH = 0x8B84;
+        private const int GL_LINK_STATUS = 0x8B82;
+        private const int GL_FRAMEBUFFER = 0x8D40;
+        private const int GL_TEXTURE0 = 0x84C0;
 
-        LoadProc(gl);
-        CreateFullscreenQuad(gl);
-        CreateTexture(gl, _width, _height);
-        EnsureCpuBuffers(_width, _height);
-        CreateOrResizePbos(gl, _width, _height);
+        // ---- PBO ----
+        private const int GL_PIXEL_UNPACK_BUFFER = 0x88EC;
+        private const int GL_STREAM_DRAW = 0x88E0;
+        private bool _usePbo;
+        private int _pbo0, _pbo1;
+        private int _pboWriteIdx;
+        private int _pboSizeBytes;
 
-        var gdm = (GraphicsDeviceManager?)_game.Services.GetService(typeof(IGraphicsDeviceManager))
-                  ?? throw new InvalidOperationException("Game must have GraphicsDeviceManager(this) in ctor.");
+        // ---- GL state ----
+        private GlInterface? _gl;
+        private int _prog, _vao, _vbo, _tex;
+        private int _uTexLoc;
+        private bool _hasVao;
 
-        // faster, sync, no vsync
-        gdm.SynchronizeWithVerticalRetrace = false;
-        gdm.IsFullScreen = false;
-        gdm.PreferredBackBufferWidth = _width;
-        gdm.PreferredBackBufferHeight = _height;
-        gdm.ApplyChanges();
+        // delegates not exposed by GlInterface
+        private delegate void Uniform1iDelegate(int location, int v0);
+        private Uniform1iDelegate? _uniform1i;
 
-        _game.InactiveSleepTime = TimeSpan.Zero;
+        private delegate void TexSubImage2DDelegate(int target, int level, int xoff, int yoff, int w, int h, int format, int type, IntPtr data);
+        private TexSubImage2DDelegate? _texSubImage2D;
 
-        RunOneMonoGameFrame(); // warm-up
-        Console.WriteLine($"[Host] Init done, size={_width}x{_height} (px)");
-    }
+        private delegate void BufferSubDataDelegate(int target, IntPtr offset, IntPtr size, IntPtr data);
+        private BufferSubDataDelegate? _bufferSubData;
 
-    /// <summary>Request resize (no GL calls here).</summary>
-    public void RequestResize(int pixelWidth, int pixelHeight, float scale)
-    {
-        _pendingW = Math.Max(1, pixelWidth);
-        _pendingH = Math.Max(1, pixelHeight);
-        _pendingScale = scale;
-        _resizePending = true;
-    }
+        // ---- size / resize ----
+        private int _width = 1, _height = 1;
+        private int _lastTexW, _lastTexH;
+        private bool _resizePending;
+        private int _pendingW, _pendingH;
+        private float _pendingScale;
 
-    /// <summary>Per-frame render on Avalonia GL thread.</summary>
-    public void Render(GlInterface gl, int framebuffer, int fbWidth, int fbHeight, float scale, double timeSeconds)
-    {
-        if (_resizePending)
-            ApplyPendingResize(gl);
+        // ---- CPU double buffer ----
+        private byte[] _buf0 = Array.Empty<byte>();
+        private byte[] _buf1 = Array.Empty<byte>();
+        private GCHandle _pin0, _pin1;
+        private IntPtr _ptr0, _ptr1;
+        private int _writeIdx;        // куда пишет MG сейчас
+        private volatile bool _hasPending;
 
-        // prepare frame N+1 on CPU
-        RunOneMonoGameFrame();
+        // diag
+        private readonly Stopwatch _sw = Stopwatch.StartNew();
+        private TimeSpan _last;
 
-        // upload frame N (if ready) via PBO
-        if (_hasPending)
+        // ============ API ============
+
+        public void Init(GlInterface gl, int width, int height, float scale)
         {
-            UploadPendingFrameViaPbo(gl);
+            _gl = gl;
+            _width = Math.Max(1, width);
+            _height = Math.Max(1, height);
+
+            Console.WriteLine($"[Host] GL: {gl.Renderer} v{gl.Version}");
+
+            // PBO доступны в DesktopGL и ES 3.0+; отключим только на ES2.
+            bool isEs2 = (gl.Version?.Contains("OpenGL ES 2", StringComparison.OrdinalIgnoreCase) ?? false)
+                      || (gl.Renderer?.Contains("OpenGL ES 2", StringComparison.OrdinalIgnoreCase) ?? false);
+            _usePbo = !isEs2;
+
+            LoadProc(gl);
+            CreateFullscreenQuad(gl);
+            CreateTexture(gl, _width, _height);
+            EnsureCpuBuffers(_width, _height);
+            if (_usePbo) CreateOrResizePbos(gl, _width, _height);
+
+            var gdm = (GraphicsDeviceManager?)_game.Services.GetService(typeof(IGraphicsDeviceManager))
+                      ?? throw new InvalidOperationException("Game must have GraphicsDeviceManager(this) in ctor.");
+
+            gdm.SynchronizeWithVerticalRetrace = false;
+            gdm.IsFullScreen = false;
+            gdm.PreferredBackBufferWidth = _width;
+            gdm.PreferredBackBufferHeight = _height;
+            gdm.ApplyChanges();
+
+            _game.InactiveSleepTime = TimeSpan.Zero;
+
+            _lastTexW = _width; _lastTexH = _height;
+            Console.WriteLine($"[Host] Init done, size={_width}x{_height}, PBO={_usePbo}");
         }
 
-        // draw fullscreen quad into Avalonia framebuffer
-        gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        gl.Viewport(0, 0, fbWidth, fbHeight);
-
-        // basic safe state (if available in GlInterface; otherwise harmless no-op)
-        // For strictness you can also load glDisable via GetProcAddress if needed
-        // gl.Disable(GL_DEPTH_TEST); gl.Disable(GL_CULL_FACE); gl.Disable(GL_BLEND);
-
-        gl.UseProgram(_prog);
-        gl.ActiveTexture(GL_TEXTURE0);
-        gl.BindTexture(GL_TEXTURE_2D, _tex);
-
-        if (_useVao)
+        public void RequestResize(int width, int height, float scale)
         {
-            gl.BindVertexArray(_vao);
-            gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            _pendingW = Math.Max(1, width);
+            _pendingH = Math.Max(1, height);
+            _pendingScale = scale;
+            _resizePending = true;
         }
-        else
-        {
-            gl.BindBuffer(GL_ARRAY_BUFFER, _vbo);
-            gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        }
-    }
 
-    /// <summary>Deinit on GL thread.</summary>
-    public void Deinit(GlInterface gl) => Dispose();
-
-    public void Dispose()
-    {
-        try
+        /// <summary>
+        /// GL-поток Avalonia: 1) (возможный) ресайз MG → CPU буферы, 2) один кадр MG, 3) аплоад (PBO), 4) фуллскрин-квад.
+        /// </summary>
+        public void Render(GlInterface gl, int framebuffer, int width, int height, float scale, double timeSeconds)
         {
-            var gl = _gl;
-            if (gl != null)
+            // --- 0) применяем отложенный ресайз на MG ---
+            if (_resizePending)
             {
-                if (_tex != 0) { gl.DeleteTexture(_tex); _tex = 0; }
-                if (_pbo0 != 0) { var b0 = _pbo0; unsafe { gl.DeleteBuffers(1, &b0); } _pbo0 = 0; }
-                if (_pbo1 != 0) { var b1 = _pbo1; unsafe { gl.DeleteBuffers(1, &b1); } _pbo1 = 0; }
-                if (_vbo != 0) { var b = _vbo; unsafe { gl.DeleteBuffers(1, &b); } _vbo = 0; }
-                if (_vao != 0 && gl.IsDeleteVertexArraysAvailable) { var a = _vao; unsafe { gl.DeleteVertexArrays(1, &a); } _vao = 0; }
-                if (_prog != 0) { gl.DeleteProgram(_prog); _prog = 0; }
+                _resizePending = false;
+                _width = _pendingW;
+                _height = _pendingH;
+
+                var gd = _game.GraphicsDevice;
+                var pp = gd.PresentationParameters;
+                pp.BackBufferWidth = _width;
+                pp.BackBufferHeight = _height;
+                gd.Reset(pp);
+                gd.Viewport = new Viewport(0, 0, _width, _height);
+
+                EnsureCpuBuffers(_width, _height);
+                _hasPending = false; // новую текстуру пересоздадим ниже
             }
-        }
-        catch { /* no-throw */ }
 
-        if (_pin0.IsAllocated) _pin0.Free();
-        if (_pin1.IsAllocated) _pin1.Free();
-        _buf0 = Array.Empty<byte>();
-        _buf1 = Array.Empty<byte>();
-        _ptr0 = _ptr1 = IntPtr.Zero;
-        _gl = null;
-    }
-
-    // =================== internals ===================
-
-    private void ApplyPendingResize(GlInterface gl)
-    {
-        _resizePending = false;
-        _width = _pendingW;
-        _height = _pendingH;
-
-        // Resize MG backbuffer
-        var gd = _game.GraphicsDevice;
-        var pp = gd.PresentationParameters;
-        pp.BackBufferWidth = _width;
-        pp.BackBufferHeight = _height;
-        gd.Reset(pp);
-        gd.Viewport = new Viewport(0, 0, _width, _height);
-
-        // Recreate CPU buffers, PBOs, and GL texture
-        EnsureCpuBuffers(_width, _height);
-        RecreateTexture(gl, _width, _height);
-        CreateOrResizePbos(gl, _width, _height);
-
-        // IMPORTANT: clear texture once (avoids black/messy frame on some drivers)
-        gl.BindTexture(GL_TEXTURE_2D, _tex);
-        using (var zero = new UnmanagedBuffer(_width * _height * 4))
-        {
-            _texSubImage2D!.Invoke(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_UNSIGNED_BYTE, zero.Ptr);
-        }
-
-        Console.WriteLine($"[Host] Resize: {_width}x{_height} (px)");
-    }
-
-    private void RunOneMonoGameFrame()
-    {
-        try { _game.RunOneFrame(); }
-        catch (Exception ex) { Console.WriteLine("[Host][ERR] RunOneFrame: " + ex); }
-
-        var writeArray = (_writeIdx == 0) ? _buf0 : _buf1;
-        int total = _width * _height * 4;
-
-        if (writeArray.Length < total)
-            Array.Resize(ref writeArray, total);
-        if (_writeIdx == 0) _buf0 = writeArray; else _buf1 = writeArray;
-
-        _game.GraphicsDevice.GetBackBufferData(writeArray, 0, total);
-        RefreshPinsIfResized();
-
-        _hasPending = true;
-        _writeIdx ^= 1;
-    }
-
-    private void EnsureCpuBuffers(int w, int h)
-    {
-        int bytes = Math.Max(1, w) * Math.Max(1, h) * 4;
-
-        _buf0 = new byte[bytes];
-        _buf1 = new byte[bytes];
-
-        if (_pin0.IsAllocated) _pin0.Free();
-        if (_pin1.IsAllocated) _pin1.Free();
-
-        _pin0 = GCHandle.Alloc(_buf0, GCHandleType.Pinned);
-        _pin1 = GCHandle.Alloc(_buf1, GCHandleType.Pinned);
-        _ptr0 = _pin0.AddrOfPinnedObject();
-        _ptr1 = _pin1.AddrOfPinnedObject();
-
-        _hasPending = false;
-        _writeIdx = 0;
-    }
-
-    private void RefreshPinsIfResized()
-    {
-        int bytes = _width * _height * 4;
-
-        if (_buf0.Length != bytes)
-        {
-            if (_pin0.IsAllocated) _pin0.Free();
-            _pin0 = GCHandle.Alloc(_buf0, GCHandleType.Pinned);
-            _ptr0 = _pin0.AddrOfPinnedObject();
-        }
-        if (_buf1.Length != bytes)
-        {
-            if (_pin1.IsAllocated) _pin1.Free();
-            _pin1 = GCHandle.Alloc(_buf1, GCHandleType.Pinned);
-            _ptr1 = _pin1.AddrOfPinnedObject();
-        }
-    }
-
-    private void LoadProc(GlInterface gl)
-    {
-        // glTexSubImage2D (fallback names)
-        var p = gl.GetProcAddress("glTexSubImage2D");
-        if (p == IntPtr.Zero) p = gl.GetProcAddress("glTexSubImage2DEXT");
-        if (p == IntPtr.Zero) throw new NotSupportedException("glTexSubImage2D is required.");
-        _texSubImage2D = (TexSubImage2DDelegate)Marshal.GetDelegateForFunctionPointer(p, typeof(TexSubImage2DDelegate));
-
-        // sampler uniform must be integer
-        var pu = gl.GetProcAddress("glUniform1i");
-        if (pu == IntPtr.Zero)
-            throw new NotSupportedException("glUniform1i is required for sampler uniforms.");
-        _uniform1i = (Uniform1iDelegate)Marshal.GetDelegateForFunctionPointer(pu, typeof(Uniform1iDelegate));
-
-        // PBO mapping
-        var pm = gl.GetProcAddress("glMapBufferRange");
-        if (pm == IntPtr.Zero) pm = gl.GetProcAddress("glMapBufferRangeEXT");
-        if (pm == IntPtr.Zero) throw new NotSupportedException("glMapBufferRange is required for PBO path.");
-        _mapBufferRange = (MapBufferRangeDelegate)Marshal.GetDelegateForFunctionPointer(pm, typeof(MapBufferRangeDelegate));
-
-        var puu = gl.GetProcAddress("glUnmapBuffer");
-        if (puu == IntPtr.Zero) puu = gl.GetProcAddress("glUnmapBufferEXT");
-        if (puu == IntPtr.Zero) throw new NotSupportedException("glUnmapBuffer is required for PBO path.");
-        _unmapBuffer = (UnmapBufferDelegate)Marshal.GetDelegateForFunctionPointer(puu, typeof(UnmapBufferDelegate));
-
-        // PixelStorei (optional but recommended)
-        var pps = gl.GetProcAddress("glPixelStorei");
-        if (pps != IntPtr.Zero)
-            _pixelStorei = (PixelStoreiDelegate)Marshal.GetDelegateForFunctionPointer(pps, typeof(PixelStoreiDelegate));
-    }
-
-    private void CreateTexture(GlInterface gl, int w, int h)
-    {
-        if (_tex != 0) gl.DeleteTexture(_tex);
-        _tex = gl.GenTexture();
-        gl.BindTexture(GL_TEXTURE_2D, _tex);
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, IntPtr.Zero);
-    }
-
-    private void RecreateTexture(GlInterface gl, int w, int h)
-    {
-        CreateTexture(gl, w, h);
-        _hasPending = false;
-    }
-
-    private void CreateOrResizePbos(GlInterface gl, int w, int h)
-    {
-        int bytes = Math.Max(1, w) * Math.Max(1, h) * 4;
-
-        // (Re)create two PBOs
-        if (_pbo0 == 0) _pbo0 = gl.GenBuffer();
-        if (_pbo1 == 0) _pbo1 = gl.GenBuffer();
-
-        // Allocate/resize storage (NULL data)
-        gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, _pbo0);
-        gl.BufferData(GL_PIXEL_UNPACK_BUFFER, new IntPtr(bytes), IntPtr.Zero, GL_STREAM_DRAW);
-
-        gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, _pbo1);
-        gl.BufferData(GL_PIXEL_UNPACK_BUFFER, new IntPtr(bytes), IntPtr.Zero, GL_STREAM_DRAW);
-
-        // unbind PBO
-        gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-        _pboWriteIndex = 0;
-    }
-
-    private void UploadPendingFrameViaPbo(GlInterface gl)
-    {
-        int pbo = (_pboWriteIndex == 0) ? _pbo0 : _pbo1;
-        var srcPtr = (_writeIdx == 0) ? _ptr1 : _ptr0; // previous completed CPU buffer
-        int bytes = _width * _height * 4;
-
-        // bind PBO for pixel unpack
-        gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-
-        // orphan old storage & map new range
-        gl.BufferData(GL_PIXEL_UNPACK_BUFFER, new IntPtr(bytes), IntPtr.Zero, GL_STREAM_DRAW);
-
-        var mapped = _mapBufferRange!(GL_PIXEL_UNPACK_BUFFER, IntPtr.Zero, new IntPtr(bytes),
-                                      GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-        if (mapped == IntPtr.Zero)
-        {
-            // fallback (very unlikely): just do client upload
-            gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-            if (_pixelStorei != null) _pixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            _texSubImage2D!(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_UNSIGNED_BYTE, srcPtr);
-            if (_pixelStorei != null) _pixelStorei(GL_UNPACK_ALIGNMENT, 4);
-        }
-        else
-        {
-            // copy CPU buffer into mapped PBO
-            unsafe
+            // --- 1) синхронизация GL-ресурсов под текущее MG разрешение ---
+            if (_tex == 0 || _width != _lastTexW || _height != _lastTexH)
             {
-                Buffer.MemoryCopy((void*)srcPtr, (void*)mapped, bytes, bytes);
-            }
-            _unmapBuffer!(GL_PIXEL_UNPACK_BUFFER);
+                RecreateTexture(gl, _width, _height);
 
-            // set tight alignment and upload from PBO (offset 0)
-            if (_pixelStorei != null) _pixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                gl.BindTexture(GL_TEXTURE_2D, _tex);
+                using (var zero = new UnmanagedBuffer(_width * _height * 4))
+                    _texSubImage2D!.Invoke(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_UNSIGNED_BYTE, zero.Ptr);
+
+                _lastTexW = _width; _lastTexH = _height;
+                if (_usePbo) CreateOrResizePbos(gl, _width, _height);
+            }
+
+            // --- 2) один кадр MonoGame → CPU buffer ---
+            RunOneMonoGameFrame();
+
+            // --- 3) upload CPU → (PBO) → Texture ---
+            if (_hasPending)
+            {
+                int byteSize = _width * _height * 4;
+                var readPtr = (_writeIdx == 0) ? _ptr1 : _ptr0; // берём противоположный
+
+                if (_usePbo)
+                {
+                    int pbo = (_pboWriteIdx == 0) ? _pbo0 : _pbo1;
+                    gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+
+                    if (_bufferSubData != null)
+                        _bufferSubData(GL_PIXEL_UNPACK_BUFFER, IntPtr.Zero, new IntPtr(byteSize), readPtr);
+                    else
+                        gl.BufferData(GL_PIXEL_UNPACK_BUFFER, new IntPtr(byteSize), readPtr, GL_STREAM_DRAW);
+
+                    gl.BindTexture(GL_TEXTURE_2D, _tex);
+                    _texSubImage2D!.Invoke(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_UNSIGNED_BYTE, IntPtr.Zero);
+
+                    gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+                    _pboWriteIdx ^= 1;
+                }
+                else
+                {
+                    gl.BindTexture(GL_TEXTURE_2D, _tex);
+                    _texSubImage2D!.Invoke(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_UNSIGNED_BYTE, readPtr);
+                }
+            }
+
+            // --- 4) рисуем фуллскрин-квад в framebuffer Avalonia ---
+            gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            gl.Viewport(0, 0, width, height);
+
+            gl.UseProgram(_prog);
+            gl.ActiveTexture(GL_TEXTURE0);
             gl.BindTexture(GL_TEXTURE_2D, _tex);
-            _texSubImage2D!(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_UNSIGNED_BYTE, IntPtr.Zero);
-            if (_pixelStorei != null) _pixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+            if (_hasVao)
+            {
+                gl.BindVertexArray(_vao);
+                gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
+            else
+            {
+                gl.BindBuffer(GL_ARRAY_BUFFER, _vbo);
+                gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
         }
 
-        // unbind PBO
-        gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        public void Deinit(GlInterface gl) => Dispose();
 
-        // toggle PBO index for next frame
-        _pboWriteIndex ^= 1;
-    }
+        public void Dispose()
+        {
+            try
+            {
+                var gl = _gl;
+                if (gl != null)
+                {
+                    if (_pbo0 != 0) { var b = _pbo0; unsafe { gl.DeleteBuffers(1, &b); } _pbo0 = 0; }
+                    if (_pbo1 != 0) { var b = _pbo1; unsafe { gl.DeleteBuffers(1, &b); } _pbo1 = 0; }
+                    if (_tex != 0) { gl.DeleteTexture(_tex); _tex = 0; }
+                    if (_vbo != 0) { var b = _vbo; unsafe { gl.DeleteBuffers(1, &b); } _vbo = 0; }
+                    if (_vao != 0 && gl.IsDeleteVertexArraysAvailable) { var a = _vao; unsafe { gl.DeleteVertexArrays(1, &a); } _vao = 0; }
+                    if (_prog != 0) { gl.DeleteProgram(_prog); _prog = 0; }
+                }
+            }
+            catch { /* ignore */ }
 
-    private void CreateFullscreenQuad(GlInterface gl)
-    {
-        bool gles = (gl.Version?.Contains("OpenGL ES", StringComparison.OrdinalIgnoreCase) ?? false)
-                 || (gl.Renderer?.Contains("OpenGL ES", StringComparison.OrdinalIgnoreCase) ?? false);
+            if (_pin0.IsAllocated) _pin0.Free();
+            if (_pin1.IsAllocated) _pin1.Free();
+            _buf0 = Array.Empty<byte>();
+            _buf1 = Array.Empty<byte>();
+            _ptr0 = _ptr1 = IntPtr.Zero;
+            _gl = null;
+        }
 
-        // Flip Y in the vertex shader (so we don't touch uniform each frame)
-        string vs = gles
-            ? @"#version 300 es
+        // ============ internals ============
+
+        private void RunOneMonoGameFrame()
+        {
+            try { _game.RunOneFrame(); }
+            catch (Exception ex) { Console.WriteLine("[Host][ERR] RunOneFrame: " + ex); }
+
+            var writeArray = (_writeIdx == 0) ? _buf0 : _buf1;
+            int total = _width * _height * 4;
+
+            if (writeArray.Length < total)
+                Array.Resize(ref writeArray, total);
+            if (_writeIdx == 0) _buf0 = writeArray; else _buf1 = writeArray;
+
+            _game.GraphicsDevice.GetBackBufferData(writeArray, 0, total);
+            RefreshPinsIfResized();
+
+            _hasPending = true;
+            _writeIdx ^= 1;
+        }
+
+        private void EnsureCpuBuffers(int w, int h)
+        {
+            int bytes = Math.Max(1, w) * Math.Max(1, h) * 4;
+
+            _buf0 = new byte[bytes];
+            _buf1 = new byte[bytes];
+
+            if (_pin0.IsAllocated) _pin0.Free();
+            if (_pin1.IsAllocated) _pin1.Free();
+
+            _pin0 = GCHandle.Alloc(_buf0, GCHandleType.Pinned);
+            _pin1 = GCHandle.Alloc(_buf1, GCHandleType.Pinned);
+            _ptr0 = _pin0.AddrOfPinnedObject();
+            _ptr1 = _pin1.AddrOfPinnedObject();
+
+            _hasPending = false;
+            _writeIdx = 0;
+        }
+
+        private void RefreshPinsIfResized()
+        {
+            int bytes = _width * _height * 4;
+
+            if (_buf0.Length != bytes)
+            {
+                if (_pin0.IsAllocated) _pin0.Free();
+                _pin0 = GCHandle.Alloc(_buf0, GCHandleType.Pinned);
+                _ptr0 = _pin0.AddrOfPinnedObject();
+            }
+            if (_buf1.Length != bytes)
+            {
+                if (_pin1.IsAllocated) _pin1.Free();
+                _pin1 = GCHandle.Alloc(_buf1, GCHandleType.Pinned);
+                _ptr1 = _pin1.AddrOfPinnedObject();
+            }
+        }
+
+        private void LoadProc(GlInterface gl)
+        {
+            var p = gl.GetProcAddress("glTexSubImage2D");
+            if (p == IntPtr.Zero) p = gl.GetProcAddress("glTexSubImage2DEXT");
+            if (p == IntPtr.Zero) throw new NotSupportedException("glTexSubImage2D is required.");
+            _texSubImage2D = (TexSubImage2DDelegate)Marshal.GetDelegateForFunctionPointer(p, typeof(TexSubImage2DDelegate));
+
+            var pu = gl.GetProcAddress("glUniform1i");
+            if (pu != IntPtr.Zero)
+                _uniform1i = (Uniform1iDelegate)Marshal.GetDelegateForFunctionPointer(pu, typeof(Uniform1iDelegate));
+
+            var ps = gl.GetProcAddress("glBufferSubData");
+            if (ps != IntPtr.Zero)
+                _bufferSubData = (BufferSubDataDelegate)Marshal.GetDelegateForFunctionPointer(ps, typeof(BufferSubDataDelegate));
+        }
+
+        private void CreateTexture(GlInterface gl, int w, int h)
+        {
+            if (_tex != 0) gl.DeleteTexture(_tex);
+            _tex = gl.GenTexture();
+            gl.BindTexture(GL_TEXTURE_2D, _tex);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, IntPtr.Zero);
+        }
+
+        private void RecreateTexture(GlInterface gl, int w, int h)
+        {
+            CreateTexture(gl, w, h);
+            _hasPending = false;
+        }
+
+        private void CreateOrResizePbos(GlInterface gl, int w, int h)
+        {
+            int needBytes = Math.Max(1, w) * Math.Max(1, h) * 4;
+            if (_pbo0 != 0 && _pbo1 != 0 && _pboSizeBytes == needBytes) return;
+
+            if (_pbo0 != 0) { var b = _pbo0; unsafe { gl.DeleteBuffers(1, &b); } _pbo0 = 0; }
+            if (_pbo1 != 0) { var b = _pbo1; unsafe { gl.DeleteBuffers(1, &b); } _pbo1 = 0; }
+
+            _pbo0 = gl.GenBuffer();
+            _pbo1 = gl.GenBuffer();
+
+            AllocatePbo(gl, _pbo0, needBytes);
+            AllocatePbo(gl, _pbo1, needBytes);
+
+            _pboSizeBytes = needBytes;
+            _pboWriteIdx = 0;
+
+            Console.WriteLine($"[Host] PBO ready size={_pboSizeBytes}");
+        }
+
+        private void AllocatePbo(GlInterface gl, int pbo, int bytes)
+        {
+            gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            gl.BufferData(GL_PIXEL_UNPACK_BUFFER, new IntPtr(bytes), IntPtr.Zero, GL_STREAM_DRAW);
+            gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
+
+        private void CreateFullscreenQuad(GlInterface gl)
+        {
+            bool gles = (gl.Version?.Contains("OpenGL ES", StringComparison.OrdinalIgnoreCase) ?? false)
+                     || (gl.Renderer?.Contains("OpenGL ES", StringComparison.OrdinalIgnoreCase) ?? false);
+
+            string vs = gles
+                ? @"#version 300 es
 precision highp float;
 layout(location=0) in vec2 aPos;
 layout(location=1) in vec2 aUv;
 out vec2 vUv;
 void main(){ vUv=vec2(aUv.x,1.0-aUv.y); gl_Position=vec4(aPos,0.0,1.0); }"
-            : @"#version 330 core
+                : @"#version 330 core
 layout(location=0) in vec2 aPos;
 layout(location=1) in vec2 aUv;
 out vec2 vUv;
 void main(){ vUv=vec2(aUv.x,1.0-aUv.y); gl_Position=vec4(aPos,0.0,1.0); }";
 
-        string fs = gles
-            ? @"#version 300 es
+            string fs = gles
+                ? @"#version 300 es
 precision highp float;
 in vec2 vUv;
 uniform sampler2D uTex;
 out vec4 frag;
 void main(){ frag = texture(uTex, vUv); }"
-            : @"#version 330 core
+                : @"#version 330 core
 in vec2 vUv;
 uniform sampler2D uTex;
 out vec4 fragColor;
 void main(){ fragColor = texture(uTex, vUv); }";
 
-        _prog = CompileProgram(gl, vs, fs);
-        gl.UseProgram(_prog);
-        _uTexLoc = gl.GetUniformLocationString(_prog, "uTex");
-        _uniform1i!(_uTexLoc, 0); // strictly integer for sampler2D
+            _prog = CompileProgram(gl, vs, fs);
+            gl.UseProgram(_prog);
+            _uTexLoc = gl.GetUniformLocationString(_prog, "uTex");
+            if (_uniform1i != null) _uniform1i(_uTexLoc, 0); else gl.Uniform1f(_uTexLoc, 0f);
 
-        // 4-vertex fullscreen quad for TRIANGLE_STRIP
-        float[] verts =
-        {
-            // pos      uv
-            -1f, -1f,  0f, 0f,
-             1f, -1f,  1f, 0f,
-            -1f,  1f,  0f, 1f,
-             1f,  1f,  1f, 1f,
-        };
-
-        if (gl.IsGenVertexArraysAvailable)
-        {
-            _vao = gl.GenVertexArray();
-            _useVao = _vao != 0;
-        }
-        if (_useVao) gl.BindVertexArray(_vao);
-
-        _vbo = gl.GenBuffer();
-        gl.BindBuffer(GL_ARRAY_BUFFER, _vbo);
-
-        var handle = GCHandle.Alloc(verts, GCHandleType.Pinned);
-        try
-        {
-            var size = new IntPtr(sizeof(float) * verts.Length);
-            gl.BufferData(GL_ARRAY_BUFFER, size, handle.AddrOfPinnedObject(), GL_STATIC_DRAW);
-        }
-        finally { handle.Free(); }
-
-        const int stride = 4 * sizeof(float);
-        gl.EnableVertexAttribArray(0);
-        gl.VertexAttribPointer(0, 2, GL_FLOAT, 0, stride, IntPtr.Zero);
-        gl.EnableVertexAttribArray(1);
-        gl.VertexAttribPointer(1, 2, GL_FLOAT, 0, stride, new IntPtr(2 * sizeof(float)));
-    }
-
-    private static int CompileProgram(GlInterface gl, string vsSrc, string fsSrc)
-    {
-        int vs = gl.CreateShader(GL_VERTEX_SHADER);
-        gl.ShaderSourceString(vs, vsSrc);
-        gl.CompileShader(vs);
-        CheckShader(gl, vs, "VS");
-
-        int fs = gl.CreateShader(GL_FRAGMENT_SHADER);
-        gl.ShaderSourceString(fs, fsSrc);
-        gl.CompileShader(fs);
-        CheckShader(gl, fs, "FS");
-
-        int prog = gl.CreateProgram();
-        gl.AttachShader(prog, vs);
-        gl.AttachShader(prog, fs);
-        gl.LinkProgram(prog);
-        CheckProgram(gl, prog);
-
-        gl.DeleteShader(vs);
-        gl.DeleteShader(fs);
-        return prog;
-    }
-
-    private static void CheckShader(GlInterface gl, int sh, string tag)
-    {
-        unsafe
-        {
-            int ok; gl.GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-            if (ok == 0)
+            float[] verts =
             {
-                int len; gl.GetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
-                var buf = new byte[Math.Max(1, len)];
-                fixed (byte* p = buf) gl.GetShaderInfoLog(sh, buf.Length, out len, p);
-                var msg = System.Text.Encoding.UTF8.GetString(buf, 0, Math.Max(0, len));
-                throw new Exception($"{tag}: {msg}");
+                // pos      uv
+                -1f, -1f,  0f, 0f,
+                 1f, -1f,  1f, 0f,
+                -1f,  1f,  0f, 1f,
+                 1f,  1f,  1f, 1f,
+            };
+
+            if (gl.IsGenVertexArraysAvailable)
+            {
+                _vao = gl.GenVertexArray();
+                _hasVao = _vao != 0;
+            }
+            if (_hasVao) gl.BindVertexArray(_vao);
+
+            _vbo = gl.GenBuffer();
+            gl.BindBuffer(GL_ARRAY_BUFFER, _vbo);
+
+            var handle = GCHandle.Alloc(verts, GCHandleType.Pinned);
+            try
+            {
+                var size = new IntPtr(sizeof(float) * verts.Length);
+                gl.BufferData(GL_ARRAY_BUFFER, size, handle.AddrOfPinnedObject(), GL_STATIC_DRAW);
+            }
+            finally { handle.Free(); }
+
+            const int stride = 4 * sizeof(float);
+            gl.EnableVertexAttribArray(0);
+            gl.VertexAttribPointer(0, 2, GL_FLOAT, 0, stride, IntPtr.Zero);
+            gl.EnableVertexAttribArray(1);
+            gl.VertexAttribPointer(1, 2, GL_FLOAT, 0, stride, new IntPtr(2 * sizeof(float)));
+        }
+
+        private static int CompileProgram(GlInterface gl, string vsSrc, string fsSrc)
+        {
+            int vs = gl.CreateShader(GL_VERTEX_SHADER);
+            gl.ShaderSourceString(vs, vsSrc);
+            gl.CompileShader(vs);
+            CheckShader(gl, vs, "VS");
+
+            int fs = gl.CreateShader(GL_FRAGMENT_SHADER);
+            gl.ShaderSourceString(fs, fsSrc);
+            gl.CompileShader(fs);
+            CheckShader(gl, fs, "FS");
+
+            int prog = gl.CreateProgram();
+            gl.AttachShader(prog, vs);
+            gl.AttachShader(prog, fs);
+            gl.LinkProgram(prog);
+            CheckProgram(gl, prog);
+
+            gl.DeleteShader(vs);
+            gl.DeleteShader(fs);
+            return prog;
+        }
+
+        private static void CheckShader(GlInterface gl, int sh, string tag)
+        {
+            unsafe
+            {
+                int ok; gl.GetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+                if (ok == 0)
+                {
+                    int len; gl.GetShaderiv(sh, GL_INFO_LOG_LENGTH, &len);
+                    var buf = new byte[Math.Max(1, len)];
+                    fixed (byte* p = buf) gl.GetShaderInfoLog(sh, buf.Length, out len, p);
+                    var msg = System.Text.Encoding.UTF8.GetString(buf, 0, Math.Max(0, len));
+                    throw new Exception($"{tag}: {msg}");
+                }
             }
         }
-    }
 
-    private static void CheckProgram(GlInterface gl, int prog)
-    {
-        unsafe
+        private static void CheckProgram(GlInterface gl, int prog)
         {
-            int ok; gl.GetProgramiv(prog, GL_LINK_STATUS, &ok);
-            if (ok == 0)
+            unsafe
             {
-                int len; gl.GetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
-                var buf = new byte[Math.Max(1, len)];
-                fixed (byte* p = buf) gl.GetProgramInfoLog(prog, buf.Length, out len, p);
-                var msg = System.Text.Encoding.UTF8.GetString(buf, 0, Math.Max(0, len));
-                throw new Exception($"PROG: {msg}");
+                int ok; gl.GetProgramiv(prog, GL_LINK_STATUS, &ok);
+                if (ok == 0)
+                {
+                    int len; gl.GetProgramiv(prog, GL_INFO_LOG_LENGTH, &len);
+                    var buf = new byte[Math.Max(1, len)];
+                    fixed (byte* p = buf) gl.GetProgramInfoLog(prog, buf.Length, out len, p);
+                    var msg = System.Text.Encoding.UTF8.GetString(buf, 0, Math.Max(0, len));
+                    throw new Exception($"PROG: {msg}");
+                }
             }
         }
-    }
 
-    /// <summary>Small RAII helper for temporary unmanaged zero buffer.</summary>
-    private sealed class UnmanagedBuffer : IDisposable
-    {
-        public IntPtr Ptr { get; }
-        private readonly int _size;
-        public UnmanagedBuffer(int size)
+        private sealed class UnmanagedBuffer : IDisposable
         {
-            _size = Math.Max(1, size);
-            Ptr = Marshal.AllocHGlobal(_size);
-            unsafe { new Span<byte>((void*)Ptr, _size).Clear(); }
+            public IntPtr Ptr { get; }
+            private readonly int _size;
+            public UnmanagedBuffer(int size)
+            {
+                _size = Math.Max(1, size);
+                Ptr = Marshal.AllocHGlobal(_size);
+                unsafe { new Span<byte>((void*)Ptr, _size).Clear(); }
+            }
+            public void Dispose() { if (Ptr != IntPtr.Zero) Marshal.FreeHGlobal(Ptr); }
         }
-        public void Dispose() { if (Ptr != IntPtr.Zero) Marshal.FreeHGlobal(Ptr); }
     }
 }

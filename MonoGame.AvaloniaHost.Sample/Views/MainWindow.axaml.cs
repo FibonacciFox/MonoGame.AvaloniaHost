@@ -13,5 +13,6 @@ public partial class MainWindow : Window
         InitializeComponent();
 
         GameHost.Game = new Game1();
+        //GameHost1.Game = new Game1();
     }
 }
