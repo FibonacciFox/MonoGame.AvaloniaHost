@@ -11,3 +11,4 @@ C:\Users\FibonacciFox\Desktop\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\MonoGa
 C:\Users\FibonacciFox\Desktop\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\obj\Debug\net9.0\refint\MonoGame.AvaloniaHost.dll
 C:\Users\FibonacciFox\Desktop\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\obj\Debug\net9.0\MonoGame.AvaloniaHost.pdb
 C:\Users\FibonacciFox\Desktop\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\obj\Debug\net9.0\ref\MonoGame.AvaloniaHost.dll
+C:\Users\FibonacciFox\Desktop\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\MonoGame.AvaloniaHost\obj\Debug\net9.0\MonoGame.AvaloniaHost.sourcelink.json

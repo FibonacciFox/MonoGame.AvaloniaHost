@@ -1,70 +1,73 @@
-﻿using System;
-using Avalonia;
+﻿using Avalonia;
+using Avalonia.Controls;
 using Avalonia.OpenGL;
 using Avalonia.OpenGL.Controls;
 using Microsoft.Xna.Framework;
 
-namespace MonoGame.AvaloniaHost;
-
-/// <summary>
-/// RU: Хост MonoGame внутри Avalonia. Все GL-действия выполняются строго в GL-потоке контрола.
-/// EN: MonoGame host inside Avalonia. All GL operations happen strictly on the control's GL thread.
-/// </summary>
-public sealed class MonoGameView : OpenGlControlBase
+namespace MonoGame.AvaloniaHost
 {
-    /// <summary>MonoGame Game (its ctor must create <c>new GraphicsDeviceManager(this)</c>).</summary>
-    public Game? Game { get; set; }
-
-    private MonoGameCpuRenderer? _renderer;
-
-    protected override void OnOpenGlInit(GlInterface gl)
+    /// <summary>
+    /// Хост MonoGame внутри Avalonia.
+    /// </summary>
+    public sealed class MonoGameView : OpenGlControlBase
     {
-        if (Game is null)
-            throw new InvalidOperationException("MonoGameView.Game must be set before initialization.");
+        public Game? Game { get; set; }
 
-        var w = Math.Max(1, (int)Math.Ceiling(Bounds.Width));
-        var h = Math.Max(1, (int)Math.Ceiling(Bounds.Height));
-        var scale = (float)(VisualRoot?.RenderScaling ?? 1f);
+        private MonoGameCpuRenderer? _renderer;
 
-        _renderer = new MonoGameCpuRenderer(Game);
-        _renderer.Init(gl, w, h, scale);
-    }
-
-    protected override void OnOpenGlRender(GlInterface gl, int fb)
-    {
-        if (_renderer is null) return;
-
-        var w = Math.Max(1, (int)Math.Ceiling(Bounds.Width));
-        var h = Math.Max(1, (int)Math.Ceiling(Bounds.Height));
-        var scale = (float)(VisualRoot?.RenderScaling ?? 1f);
-
-        // Render() сам применяет отложенный ресайз по debounce на GL-потоке.
-        _renderer.Render(gl, fb, w, h, scale, 0.0);
-
-        // просим следующий кадр (continuous rendering)
-        RequestNextFrameRendering();
-    }
-
-    protected override void OnOpenGlDeinit(GlInterface gl)
-    {
-        _renderer?.Deinit(gl);
-        _renderer?.Dispose();
-        _renderer = null;
-    }
-
-    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
-    {
-        base.OnPropertyChanged(change);
-
-        // ВАЖНО: никаких GL-вызовов в UI-потоке!
-        if (change.Property == BoundsProperty && IsEffectivelyVisible && _renderer is not null)
+        private static void ComputePixelSize(Visual visual, Rect bounds,
+            out int pixelW, out int pixelH, out float scale)
         {
-            var w = Math.Max(1, (int)Math.Ceiling(Bounds.Width));
-            var h = Math.Max(1, (int)Math.Ceiling(Bounds.Height));
-            var scale = (float)(VisualRoot?.RenderScaling ?? 1f);
+            var tl = TopLevel.GetTopLevel(visual);
+            scale = (float)(tl?.RenderScaling ?? 1.0);
 
-            // только запросить ресайз; реальный GL-ресайз будет сделан в Render() после debounce
-            _renderer.RequestResize(w, h, scale);
+            int logicalW = Math.Max(1, (int)Math.Ceiling(bounds.Width));
+            int logicalH = Math.Max(1, (int)Math.Ceiling(bounds.Height));
+
+            pixelW = Math.Max(1, (int)MathF.Ceiling(logicalW * scale));
+            pixelH = Math.Max(1, (int)MathF.Ceiling(logicalH * scale));
+        }
+
+        protected override void OnOpenGlInit(GlInterface gl)
+        {
+            if (Game is null)
+                throw new InvalidOperationException("MonoGameView.Game must be set before initialization.");
+
+            // ввод больше не пробрасываем, фокус не обязателен
+            Focusable = true;
+
+            ComputePixelSize(this, Bounds, out var pw, out var ph, out var scale);
+
+            _renderer = new MonoGameCpuRenderer(Game);
+            _renderer.Init(gl, pw, ph, scale);
+        }
+
+        protected override void OnOpenGlRender(GlInterface gl, int fb)
+        {
+            if (_renderer is null) return;
+
+            ComputePixelSize(this, Bounds, out var pw, out var ph, out var scale);
+
+            _renderer.Render(gl, fb, pw, ph, scale, 0.0);
+            RequestNextFrameRendering();
+        }
+
+        protected override void OnOpenGlDeinit(GlInterface gl)
+        {
+            _renderer?.Deinit(gl);
+            _renderer?.Dispose();
+            _renderer = null;
+        }
+
+        protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+        {
+            base.OnPropertyChanged(change);
+
+            if (change.Property == BoundsProperty && IsEffectivelyVisible && _renderer is not null)
+            {
+                ComputePixelSize(this, Bounds, out var pw, out var ph, out var scale);
+                _renderer.RequestResize(pw, ph, scale);
+            }
         }
     }
 }
