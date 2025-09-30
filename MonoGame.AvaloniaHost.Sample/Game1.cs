@@ -71,6 +71,8 @@ public class Game1 : Game
     protected override void Initialize()
     {
         base.Initialize();
+        _rtProvider = (IExternalRenderTargetProvider?)Services.GetService(typeof(IExternalRenderTargetProvider));
+        
         SpawnShapes(24);
         Window.ClientSizeChanged += (_, __) =>
         {
@@ -124,9 +126,16 @@ public class Game1 : Game
 
         base.Update(gameTime);
     }
+    
+    // кешируем сервис (можно и запрашивать каждый кадр)
+    private IExternalRenderTargetProvider? _rtProvider;
 
     protected override void Draw(GameTime gameTime)
     {
+        var rt = _rtProvider?.CurrentRt;
+        if (rt != null)
+            GraphicsDevice.SetRenderTarget(rt);
+        
         GraphicsDevice.Clear(new Color(10, 10, 12));
 
         _spriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
@@ -179,7 +188,9 @@ public class Game1 : Game
         _font.DrawString(_spriteBatch, hud, new Vector2(16, 16), 3, Color.White);
 
         _spriteBatch.End();
-
+        
+        if (rt != null)
+            GraphicsDevice.SetRenderTarget(null);
         base.Draw(gameTime);
     }
 

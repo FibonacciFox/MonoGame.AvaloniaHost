@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -7,8 +8,8 @@ using Avalonia.OpenGL;
 namespace MonoGame.AvaloniaHost
 {
     /// <summary>
-    /// MonoGame → CPU double buffer → PBO(double) → glTexSubImage2D → fullscreen quad.
-    /// Вариант для одного MonoGameView: кадр MonoGame считается в Render() Avalonia, PBO включены.
+    /// MG → RenderTarget2D → CPU double buffer → PBO(double) → glTexSubImage2D → fullscreen quad.
+    /// Рендер в RT делает Игра (через сервис), рендерер лишь читает RT и аплоадит в текстуру Avalonia.
     /// </summary>
     public sealed class MonoGameCpuRenderer : IDisposable
     {
@@ -68,19 +69,24 @@ namespace MonoGame.AvaloniaHost
         private int _pendingW, _pendingH;
         private float _pendingScale;
 
+        // ---- Offscreen RT (создает рендерер, рисует игра) ----
+        private RenderTarget2D? _rt;
+        private bool _rtGetDataAsBytesSupported = true;
+        private Color[] _tmpColor = Array.Empty<Color>();
+
         // ---- CPU double buffer ----
         private byte[] _buf0 = Array.Empty<byte>();
         private byte[] _buf1 = Array.Empty<byte>();
         private GCHandle _pin0, _pin1;
         private IntPtr _ptr0, _ptr1;
-        private int _writeIdx;        // куда пишет MG сейчас
+        private int _writeIdx;        // куда пишет MG сейчас (по сути, какой CPU-буфер станет readable)
         private volatile bool _hasPending;
 
         // diag
         private readonly Stopwatch _sw = Stopwatch.StartNew();
         private TimeSpan _last;
 
-        // ============ API ============
+        // ======== public API ========
 
         public void Init(GlInterface gl, int width, int height, float scale)
         {
@@ -90,10 +96,11 @@ namespace MonoGame.AvaloniaHost
 
             Console.WriteLine($"[Host] GL: {gl.Renderer} v{gl.Version}");
 
-            // PBO доступны в DesktopGL и ES 3.0+; отключим только на ES2.
+            // PBO есть почти везде, кроме ES2
             bool isEs2 = (gl.Version?.Contains("OpenGL ES 2", StringComparison.OrdinalIgnoreCase) ?? false)
                       || (gl.Renderer?.Contains("OpenGL ES 2", StringComparison.OrdinalIgnoreCase) ?? false);
             _usePbo = !isEs2;
+            Console.WriteLine($"[Host] ES2={isEs2}, PBO={_usePbo}");
 
             LoadProc(gl);
             CreateFullscreenQuad(gl);
@@ -112,6 +119,12 @@ namespace MonoGame.AvaloniaHost
 
             _game.InactiveSleepTime = TimeSpan.Zero;
 
+            CreateOrResizeRenderTarget(_width, _height);
+
+            // зарегистрируем провайдера RT (чтобы Game1 могла брать его и рендерить)
+            if (_game.Services.GetService(typeof(IExternalRenderTargetProvider)) is null)
+                _game.Services.AddService(typeof(IExternalRenderTargetProvider), new RtProvider(this));
+
             _lastTexW = _width; _lastTexH = _height;
             Console.WriteLine($"[Host] Init done, size={_width}x{_height}, PBO={_usePbo}");
         }
@@ -121,33 +134,46 @@ namespace MonoGame.AvaloniaHost
             _pendingW = Math.Max(1, width);
             _pendingH = Math.Max(1, height);
             _pendingScale = scale;
+
+            if (_pendingW == _width && _pendingH == _height)
+                return;
+
             _resizePending = true;
         }
 
         /// <summary>
-        /// GL-поток Avalonia: 1) (возможный) ресайз MG → CPU буферы, 2) один кадр MG, 3) аплоад (PBO), 4) фуллскрин-квад.
+        /// GL-поток Avalonia: 1) обработка ресайза, 2) кадр MG (игра рисует в RT),
+        /// 3) чтение RT → CPU, 4) аплоад (PBO), 5) фуллскрин-квад.
         /// </summary>
         public void Render(GlInterface gl, int framebuffer, int width, int height, float scale, double timeSeconds)
         {
-            // --- 0) применяем отложенный ресайз на MG ---
+            // --- ресайз MG/RT/CPU ---
             if (_resizePending)
             {
                 _resizePending = false;
                 _width = _pendingW;
                 _height = _pendingH;
 
-                var gd = _game.GraphicsDevice;
-                var pp = gd.PresentationParameters;
-                pp.BackBufferWidth = _width;
-                pp.BackBufferHeight = _height;
-                gd.Reset(pp);
-                gd.Viewport = new Viewport(0, 0, _width, _height);
+                try
+                {
+                    var gd = _game.GraphicsDevice;
+                    var pp = gd.PresentationParameters;
+                    pp.BackBufferWidth = _width;
+                    pp.BackBufferHeight = _height;
+                    gd.Reset(pp);
+                    gd.Viewport = new Viewport(0, 0, _width, _height);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[Host][WARN] Reset failed: " + ex.Message);
+                }
 
+                CreateOrResizeRenderTarget(_width, _height);
                 EnsureCpuBuffers(_width, _height);
-                _hasPending = false; // новую текстуру пересоздадим ниже
+                _hasPending = false;
             }
 
-            // --- 1) синхронизация GL-ресурсов под текущее MG разрешение ---
+            // --- синхронизация GL-текстуры под текущее разрешение ---
             if (_tex == 0 || _width != _lastTexW || _height != _lastTexH)
             {
                 RecreateTexture(gl, _width, _height);
@@ -160,14 +186,17 @@ namespace MonoGame.AvaloniaHost
                 if (_usePbo) CreateOrResizePbos(gl, _width, _height);
             }
 
-            // --- 2) один кадр MonoGame → CPU buffer ---
-            RunOneMonoGameFrame();
+            // --- 1 кадр игры (игра САМА привязывает/снимает RT в Draw) ---
+            RunOneMonoGameFrame_NoRtBinding();
 
-            // --- 3) upload CPU → (PBO) → Texture ---
+            // --- чтение RT → CPU ---
+            ReadbackRtToCpu();
+
+            // --- аплоад CPU → (PBO) → Текстура ---
             if (_hasPending)
             {
                 int byteSize = _width * _height * 4;
-                var readPtr = (_writeIdx == 0) ? _ptr1 : _ptr0; // берём противоположный
+                var readPtr = (_writeIdx == 0) ? _ptr1 : _ptr0; // читаем противоположный буфер
 
                 if (_usePbo)
                 {
@@ -192,7 +221,7 @@ namespace MonoGame.AvaloniaHost
                 }
             }
 
-            // --- 4) рисуем фуллскрин-квад в framebuffer Avalonia ---
+            // --- нарисовать фуллскрин-квад в framebuffer Avalonia ---
             gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
             gl.Viewport(0, 0, width, height);
 
@@ -231,6 +260,8 @@ namespace MonoGame.AvaloniaHost
             }
             catch { /* ignore */ }
 
+            if (_rt != null) { try { _rt.Dispose(); } catch { } _rt = null; }
+
             if (_pin0.IsAllocated) _pin0.Free();
             if (_pin1.IsAllocated) _pin1.Free();
             _buf0 = Array.Empty<byte>();
@@ -239,25 +270,73 @@ namespace MonoGame.AvaloniaHost
             _gl = null;
         }
 
-        // ============ internals ============
+        // ======== internals ========
 
-        private void RunOneMonoGameFrame()
+        private void RunOneMonoGameFrame_NoRtBinding()
         {
             try { _game.RunOneFrame(); }
             catch (Exception ex) { Console.WriteLine("[Host][ERR] RunOneFrame: " + ex); }
+        }
 
-            var writeArray = (_writeIdx == 0) ? _buf0 : _buf1;
-            int total = _width * _height * 4;
+        private void ReadbackRtToCpu()
+        {
+            if (_rt == null) { _hasPending = false; return; }
 
-            if (writeArray.Length < total)
-                Array.Resize(ref writeArray, total);
-            if (_writeIdx == 0) _buf0 = writeArray; else _buf1 = writeArray;
+            try
+            {
+                int total = _width * _height * 4;
+                var writeArray = (_writeIdx == 0) ? _buf0 : _buf1;
+                if (writeArray.Length != total)
+                {
+                    Array.Resize(ref writeArray, total);
+                    if (_writeIdx == 0) _buf0 = writeArray; else _buf1 = writeArray;
+                }
 
-            _game.GraphicsDevice.GetBackBufferData(writeArray, 0, total);
-            RefreshPinsIfResized();
+                bool ok = _rtGetDataAsBytesSupported;
+                if (ok)
+                {
+                    try { _rt.GetData<byte>(writeArray, 0, total); }
+                    catch
+                    {
+                        ok = false;
+                        _rtGetDataAsBytesSupported = false;
+                    }
+                }
 
-            _hasPending = true;
-            _writeIdx ^= 1;
+                if (!ok)
+                {
+                    int pixels = _width * _height;
+                    if (_tmpColor.Length != pixels) _tmpColor = new Color[pixels];
+                    _rt.GetData<Color>(_tmpColor, 0, pixels);
+                    Buffer.BlockCopy(_tmpColor, 0, writeArray, 0, total);
+                }
+
+                RefreshPinsForCpuBuffers(total);
+                _hasPending = true;
+                _writeIdx ^= 1;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[Host][ERR] Readback RT: " + ex);
+                _hasPending = false;
+            }
+        }
+
+        private void CreateOrResizeRenderTarget(int w, int h)
+        {
+            if (_rt != null) { try { _rt.Dispose(); } catch { } _rt = null; }
+
+            _rt = new RenderTarget2D(
+                _game.GraphicsDevice,
+                Math.Max(1, w),
+                Math.Max(1, h),
+                mipMap: false,
+                preferredFormat: SurfaceFormat.Color,
+                preferredDepthFormat: DepthFormat.None,
+                preferredMultiSampleCount: 0,
+                usage: RenderTargetUsage.PreserveContents);
+
+            _rtGetDataAsBytesSupported = true; // переопробуем на новом RT
         }
 
         private void EnsureCpuBuffers(int w, int h)
@@ -279,17 +358,15 @@ namespace MonoGame.AvaloniaHost
             _writeIdx = 0;
         }
 
-        private void RefreshPinsIfResized()
+        private void RefreshPinsForCpuBuffers(int totalBytes)
         {
-            int bytes = _width * _height * 4;
-
-            if (_buf0.Length != bytes)
+            if (_buf0.Length != totalBytes)
             {
                 if (_pin0.IsAllocated) _pin0.Free();
                 _pin0 = GCHandle.Alloc(_buf0, GCHandleType.Pinned);
                 _ptr0 = _pin0.AddrOfPinnedObject();
             }
-            if (_buf1.Length != bytes)
+            if (_buf1.Length != totalBytes)
             {
                 if (_pin1.IsAllocated) _pin1.Free();
                 _pin1 = GCHandle.Alloc(_buf1, GCHandleType.Pinned);
@@ -311,6 +388,8 @@ namespace MonoGame.AvaloniaHost
             var ps = gl.GetProcAddress("glBufferSubData");
             if (ps != IntPtr.Zero)
                 _bufferSubData = (BufferSubDataDelegate)Marshal.GetDelegateForFunctionPointer(ps, typeof(BufferSubDataDelegate));
+            else
+                Console.WriteLine("[Host] glBufferSubData not available — falling back to BufferData each frame.");
         }
 
         private void CreateTexture(GlInterface gl, int w, int h)
@@ -323,6 +402,9 @@ namespace MonoGame.AvaloniaHost
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, IntPtr.Zero);
+
+            using var zero = new UnmanagedBuffer(w * h * 4);
+            _texSubImage2D!.Invoke(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, zero.Ptr);
         }
 
         private void RecreateTexture(GlInterface gl, int w, int h)
@@ -481,6 +563,16 @@ void main(){ fragColor = texture(uTex, vUv); }";
                     throw new Exception($"PROG: {msg}");
                 }
             }
+        }
+
+        // --- маленький провайдер для ServiceContainer ---
+        private sealed class RtProvider : IExternalRenderTargetProvider
+        {
+            private readonly MonoGameCpuRenderer _r;
+            public RtProvider(MonoGameCpuRenderer r) => _r = r;
+            public RenderTarget2D? CurrentRt => _r._rt;
+            public int Width => _r._width;
+            public int Height => _r._height;
         }
 
         private sealed class UnmanagedBuffer : IDisposable
